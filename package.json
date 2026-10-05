@@ -9,6 +9,7 @@
     "test": "node scripts/test-cycle.js",
     "test:replan": "node scripts/test-replan.js",
     "test:replan-event-ids": "node scripts/test-replan-event-ids.js",
+    "test:replan-label-version": "node scripts/test-replan-label-version.js",
     "test:labels": "node scripts/test-labels.js",
     "test:label-corrections": "node scripts/test-label-corrections.js",
     "test:shipments": "node scripts/test-shipments.js",
