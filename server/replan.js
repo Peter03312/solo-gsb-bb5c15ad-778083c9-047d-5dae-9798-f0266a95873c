@@ -11,6 +11,9 @@
 // 版本（业务版本）采用无状态签名令牌：载荷为「正式状态指纹 + 变更内容哈希 + 时间戳」，
 // 用进程密钥做 HMAC。预演后任何会改变推导输入/结果的正式写入
 // （事件、原料过敏原、放行等）都会改变指纹，应用时指纹对不上即拒绝且原状态不变。
+// 标签卷的登记、核销与核销更正同样纳入指纹：这些正式写入会改变
+// “拟停用卷及已贴待复核数量”的预测基础，旧预演版本必须过期（409 VERSION_EXPIRED），
+// 否则按过期预测确认会导致预测与落库结果不符。
 //
 // 拟插入清洗事件的编号一致性：影子库完整沿用正式库的事件自增序列（sqlite_sequence），
 // 且事件序列本身纳入状态指纹——因此同一有效预演版本下，预演返回的
@@ -375,6 +378,16 @@ const FINGERPRINT_SQL = [
   'SELECT id, code FROM batches ORDER BY id',
   `SELECT id, batch_id, released_at, released_by, snapshot_allergens, status,
           invalid_reason, created_event_seq FROM releases ORDER BY id`,
+  // 标签卷及其核销/更正流水纳入指纹：预演会预测“拟停用卷及已贴待复核数量”，
+  // 预演后登记新卷、核销（贴用/作废）或核销更正都会改变该预测基础，
+  // 旧预演版本应过期（409 VERSION_EXPIRED），须重新预演后再确认。
+  `SELECT id, roll_code, batch_id, release_id, print_qty, applied_qty, void_qty, revision,
+          allergen_set, registered_at, registered_by, status, retired_reason
+     FROM label_rolls ORDER BY id`,
+  `SELECT id, roll_id, used_at, applied_qty, void_qty, expected_revision, used_by
+     FROM label_roll_usages ORDER BY id`,
+  `SELECT id, usage_id, roll_id, seq, target_applied_qty, target_void_qty, expected_revision,
+          corrected_by, reason, corrected_at FROM label_usage_corrections ORDER BY id`,
   // 出货单/明细不影响推导结果，但会影响“将停用卷/待评估出货单”的预测，故一并纳入指纹：
   // 预演后新增出货等正式写入会使旧版本过期，避免按过期预测确认应用。
   `SELECT id, shipment_code, batch_id, batch_code, ship_qty, allergen_set, status,

@@ -157,7 +157,8 @@ curl -s -X POST http://localhost:3000/api/replan/preview \
   在**一次事务**中重新校验版本、重新做全量校验并重算落库。
 - 预演返回的拟插入清洗事件编号（`inserted_clean_events`）与确认应用实际分配的编号
   **逐项一致**（影子库沿用正式库自增序列；详见下文「换线预演编号一致性与对账」）。
-- **预演后任何会影响这些结果的正式写入**（新增/更正/删除事件、改原料过敏原、登记/删除放行等）
+- **预演后任何会影响这些结果的正式写入**（新增/更正/删除事件、改原料过敏原、登记/删除放行、
+  **登记标签卷、核销或核销更正标签卷**、出货、登记质量处置、停机窗口、隔离令、批号库存等）
   **均使该版本过期**：应用返回 `409 VERSION_EXPIRED` 且**原状态不变**，需重新预演。
 - 以下情况在预演阶段即明确拒绝（HTTP 400，`details` 给出逐条中文原因，预演失败可见原因）：
   未知事件、同一事件被重复更正、设备不存在、拟插入的清洗事件缺少时间、
@@ -242,7 +243,7 @@ curl -s -X POST http://localhost:3000/api/replan/apply \
 | 整组后时间线校验失败（未来引用/环/时间冲突/批次重复产出） | 400 | `REPLAN_REJECTED` |
 | 版本签名损坏或格式非法 | 400 | `VERSION_INVALID` |
 | apply 的 changes 与预演不一致 | 409 | `CHANGES_MISMATCH` |
-| 预演后正式数据已变更导致版本过期（含重复应用同一版本；含新增/删除事件等改变“将分配编号”的写入，即使现存事件清单随后恢复原样） | 409 | `VERSION_EXPIRED` |
+| 预演后正式数据已变更导致版本过期（含重复应用同一版本；含新增/删除事件等改变“将分配编号”的写入，即使现存事件清单随后恢复原样；含标签卷登记/核销/核销更正等改变“拟停用卷及已贴待复核数量”预测基础的写入） | 409 | `VERSION_EXPIRED` |
 
 ## 换线预演编号一致性与对账（本轮修复）
 
@@ -312,6 +313,79 @@ curl -s -X POST http://localhost:3000/api/replan/apply ...     # 携带版本 V 
 
 端到端测试：`npm run test:replan-event-ids`。
 
+## 换线预演版本失效：标签卷登记/核销/核销更正（本轮修复）
+
+换线预演会预测 `diff.label_rolls_will_retire`（应用后**将被永久停用的标签卷**及其
+**已贴待复核张数** `applied_pending_review`）。此前标签卷的**登记、核销、核销更正**
+未纳入预演版本指纹：预演后发生这些正式写入，旧版本仍能确认成功，导致预测（哪些卷停用、
+各卷已贴待复核多少张）与确认应用的实际结果不符。本轮修复后：
+
+- **标签卷正式写入纳入版本指纹**：预演后登记新卷（`POST /api/label-rolls`）、
+  核销（`POST /api/label-rolls/:id/consume`）或核销更正
+  （`POST /api/label-rolls/:id/usages/:usageId/corrections`、`POST /api/label-usages/:usageId/corrections`）
+  发生正式写入时，携原 `version` 和相同 `changes` 确认应用返回**既有 `409 VERSION_EXPIRED`**，
+  **整组变更不落库、不占用事件编号**，须重新预演后再确认。
+- **重新预演并成功确认后**，预演预测的拟停用卷及已贴待复核数量与确认应用的
+  `retired_rolls` / `diff.label_rolls_will_retire` **逐项一致**（卷号与已贴待复核张数）。
+- **预演仍为只读**；原有版本与变更内容校验（`VERSION_INVALID` / `CHANGES_MISMATCH` /
+  `VERSION_EXPIRED` 语义）、带 `client_key` 及无键清洗事件的编号对应规则均保持不变
+  （无新增错误码，响应字段形状不变）。
+
+#### 调用示例（curl，基于演示数据）
+
+```bash
+# 1) 预演：给 BATCH-002 的加工事件（演示库 #3）加入花生原料，
+#    BATCH-003 集合将新增“花生” -> 放行失效 -> LABEL-0001 将停用（已贴待复核 120）
+CHANGES='[
+  {"op":"update","event_id":3,"type":"PROCESS","event_time":"2026-09-30T10:00",
+   "equipment_id":1,"note":"蛋糕糊（加入花生）","batch_code":"BATCH-002",
+   "material_ids":[3,4,6],"ref_batch_ids":[]},
+  {"op":"insert_clean","client_key":"wash-final","event_time":"2026-10-01T08:00",
+   "equipment_id":1,"note":"换线后追加已核实清洗"}
+]'
+curl -s -X POST http://localhost:3000/api/replan/preview \
+  -H 'Content-Type: application/json' -d "{\"changes\":$CHANGES}"
+# -> { ok:true, version:"<V1>", inserted_clean_events:[{client_key:"wash-final",event_id:10}],
+#      diff:{ label_rolls_will_retire:[{roll_code:"LABEL-0001",applied_pending_review:120,...}], ... } }
+
+# 2) 预演后登记新标签卷（正式写入；核销/核销更正同理使版本过期）
+curl -s -X POST http://localhost:3000/api/label-rolls \
+  -H 'Content-Type: application/json' -d '{
+    "batch_id":3,"release_id":1,"allergens":["乳","蛋","芝麻"],
+    "print_qty":300,"registered_by":"包装组长-李雷"
+  }'
+# -> { id:2, roll_code:"LABEL-0002", ... }
+
+# 3) 携原 version 与相同 changes 确认 -> 409 VERSION_EXPIRED，整组不落库、不占事件编号
+curl -s -X POST http://localhost:3000/api/replan/apply \
+  -H 'Content-Type: application/json' -d "{\"version\":\"<V1>\",\"changes\":$CHANGES}"
+# -> 409 { code:"VERSION_EXPIRED",
+#          error:"预演后正式数据已发生影响推导结果的写入，该预演版本已过期；请重新预演后再应用" }
+#    正式库无新增事件、LABEL-0001/LABEL-0002 均仍 ACTIVE；编号 10 未被占用。
+
+# 4) 重新预演：预测随正式写入更新（新卷 LABEL-0002 也在拟停用之列，已贴 0）
+curl -s -X POST http://localhost:3000/api/replan/preview \
+  -H 'Content-Type: application/json' -d "{\"changes\":$CHANGES}"
+# -> { ok:true, version:"<V2>", inserted_clean_events:[{client_key:"wash-final",event_id:10}],
+#      diff:{ label_rolls_will_retire:[{roll_code:"LABEL-0001",applied_pending_review:120},
+#                                      {roll_code:"LABEL-0002",applied_pending_review:0}] } }
+
+# 5) 确认应用：拟停用卷及已贴待复核数量与重新预演逐项一致
+curl -s -X POST http://localhost:3000/api/replan/apply \
+  -H 'Content-Type: application/json' -d "{\"version\":\"<V2>\",\"changes\":$CHANGES}"
+# -> { ok:true, phase:"APPLIED",
+#      inserted_clean_events:[{client_key:"wash-final",event_id:10}],
+#      retired_rolls:[{roll_code:"LABEL-0001",applied_pending_review:120,...},
+#                     {roll_code:"LABEL-0002",applied_pending_review:0,...}], ... }
+```
+
+> 若第 2 步改为核销（`POST /api/label-rolls/1/consume`，如贴用 +10）或核销更正
+> （如把原核销 #1 更正为 110/3），旧版本确认同样 `409 VERSION_EXPIRED`；
+> 重新预演的 `applied_pending_review` 会随最新有效数量更新（130 / 140），
+> 确认应用结果与重新预演逐项一致。
+
+端到端测试：`npm run test:replan-label-rolls`。
+
 ## 过敏原标签卷（包装前登记 → 核销贴用/作废）
 
 包装前，按**现有批次**与其**有效放行记录**登记一卷过敏原标签：
@@ -333,6 +407,8 @@ curl -s -X POST http://localhost:3000/api/replan/apply ...     # 携带版本 V 
   批次卡片上也有该批标签卷数量摘要，可一键跳转。
 - 整组预演返回的 `diff.label_rolls_will_retire` 会列出应用后**将被永久停用**的卷（含待复核张数），
   预演本身不停用任何正式卷；确认应用的响应 `retired_rolls` 为实际停用的卷。
+  预演后**登记、核销或核销更正**标签卷都会使该预演版本过期（`409 VERSION_EXPIRED`），
+  须重新预演，保证预测与确认结果逐项一致（见「换线预演版本失效：标签卷登记/核销/核销更正」）。
 
 ### HTTP API
 
